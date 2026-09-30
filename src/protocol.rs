@@ -29,6 +29,16 @@ pub enum ParseError {
     TooDeep,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum EncodeError {
+    #[error("simple string/error contains CR or LF")]
+    InvalidString,
+    #[error("value exceeds size limit")]
+    TooLarge,
+    #[error("value nested too deeply")]
+    TooDeep,
+}
+
 pub struct RespParser<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -131,7 +141,6 @@ impl<'a> RespParser<'a> {
         }
 
         let payload = self.buf[self.pos..self.pos + len].to_vec();
-
         self.pos += len;
 
         self.expect_crlf()?;
@@ -211,6 +220,82 @@ impl<'a> RespParser<'a> {
 
         self.pos += 2;
 
+        Ok(())
+    }
+}
+
+impl RespValue {
+    pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out)?;
+        Ok(out)
+    }
+
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let start = out.len();
+        let res = self.encode_value(out, 0);
+        if res.is_err() {
+            out.truncate(start);
+        }
+        res
+    }
+
+    fn encode_value(
+        &self,
+        out: &mut Vec<u8>,
+        depth: usize,
+    ) -> Result<(), EncodeError> {
+        if depth > MAX_DEPTH {
+            return Err(EncodeError::TooDeep);
+        }
+
+        match self {
+            Self::SimpleString(s) => Self::encode_line(out, b'+', s)?,
+            Self::Error(s) => Self::encode_line(out, b'-', s)?,
+            Self::Integer(n) => {
+                out.push(b':');
+                out.extend_from_slice(n.to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+            },
+            Self::BulkString(None) => out.extend_from_slice(b"$-1\r\n"),
+            Self::BulkString(Some(data)) => {
+                if data.len() > MAX_BULK_LEN {
+                    return Err(EncodeError::TooLarge);
+                }
+                out.push(b'$');
+                out.extend_from_slice(data.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(data);
+                out.extend_from_slice(b"\r\n");
+            },
+            Self::Array(None) => out.extend_from_slice(b"*-1\r\n"),
+            Self::Array(Some(items)) => {
+                if items.len() > MAX_ARRAY_LEN {
+                    return Err(EncodeError::TooLarge);
+                }
+                out.push(b'*');
+                out.extend_from_slice(items.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                for item in items {
+                    item.encode_value(out, depth + 1)?;
+                }
+            },
+        }
+
+        Ok(())
+    }
+
+    fn encode_line(
+        out: &mut Vec<u8>,
+        prefix: u8,
+        s: &str,
+    ) -> Result<(), EncodeError> {
+        if s.bytes().any(|b| b == b'\r' || b == b'\n') {
+            return Err(EncodeError::InvalidString);
+        }
+        out.push(prefix);
+        out.extend_from_slice(s.as_bytes());
+        out.extend_from_slice(b"\r\n");
         Ok(())
     }
 }
@@ -641,5 +726,135 @@ mod tests {
             "invalid type byte: 63"
         );
         assert_eq!(ParseError::TooDeep.to_string(), "frame nested too deeply");
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    fn bulk(s: &str) -> RespValue {
+        RespValue::BulkString(Some(s.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn encodes_each_type() {
+        let cases: Vec<(RespValue, &[u8])> = vec![
+            (RespValue::SimpleString("OK".into()), b"+OK\r\n"),
+            (RespValue::SimpleString(String::new()), b"+\r\n"),
+            (RespValue::Error("ERR bad".into()), b"-ERR bad\r\n"),
+            (RespValue::Integer(0), b":0\r\n"),
+            (RespValue::Integer(-42), b":-42\r\n"),
+            (RespValue::Integer(i64::MAX), b":9223372036854775807\r\n"),
+            (RespValue::Integer(i64::MIN), b":-9223372036854775808\r\n"),
+            (bulk("hello"), b"$5\r\nhello\r\n"),
+            (RespValue::BulkString(Some(vec![])), b"$0\r\n\r\n"),
+            (RespValue::BulkString(None), b"$-1\r\n"),
+            (RespValue::Array(None), b"*-1\r\n"),
+            (RespValue::Array(Some(vec![])), b"*0\r\n"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(value.encode().unwrap(), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn encodes_nested_array() {
+        let v = RespValue::Array(Some(vec![
+            bulk("SET"),
+            RespValue::Array(Some(vec![RespValue::Integer(1)])),
+            RespValue::BulkString(None),
+        ]));
+        assert_eq!(
+            v.encode().unwrap(),
+            b"*3\r\n$3\r\nSET\r\n*1\r\n:1\r\n$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn bulk_string_is_binary_safe() {
+        let v = RespValue::BulkString(Some(vec![0, b'\r', b'\n', 0xff]));
+        assert_eq!(v.encode().unwrap(), b"$4\r\n\x00\r\n\xff\r\n");
+    }
+
+    #[test]
+    fn rejects_crlf_in_simple_string_and_error() {
+        for s in ["a\r\nb", "a\rb", "a\nb"] {
+            assert_eq!(
+                RespValue::SimpleString(s.into()).encode(),
+                Err(EncodeError::InvalidString)
+            );
+            assert_eq!(
+                RespValue::Error(s.into()).encode(),
+                Err(EncodeError::InvalidString)
+            );
+        }
+    }
+
+    #[test]
+    fn error_leaves_buffer_unchanged() {
+        let mut out = b"prefix".to_vec();
+        let v = RespValue::Array(Some(vec![
+            RespValue::Integer(1),
+            RespValue::SimpleString("bad\r\n".into()),
+        ]));
+        assert_eq!(v.encode_into(&mut out), Err(EncodeError::InvalidString));
+        assert_eq!(out, b"prefix");
+    }
+
+    #[test]
+    fn encode_into_appends() {
+        let mut out = Vec::new();
+        RespValue::SimpleString("OK".into())
+            .encode_into(&mut out)
+            .unwrap();
+        RespValue::Integer(5).encode_into(&mut out).unwrap();
+        assert_eq!(out, b"+OK\r\n:5\r\n");
+    }
+
+    #[test]
+    fn depth_limit_matches_parser() {
+        let build = |levels: usize| {
+            let mut v = RespValue::Array(Some(vec![]));
+            for _ in 0..levels {
+                v = RespValue::Array(Some(vec![v]));
+            }
+            v
+        };
+        assert!(build(MAX_DEPTH).encode().is_ok());
+        assert_eq!(build(MAX_DEPTH + 1).encode(), Err(EncodeError::TooDeep));
+    }
+
+    #[test]
+    fn array_length_limit() {
+        let v = RespValue::Array(Some(vec![
+            RespValue::Integer(0);
+            MAX_ARRAY_LEN + 1
+        ]));
+        assert_eq!(v.encode(), Err(EncodeError::TooLarge));
+    }
+
+    #[test]
+    fn round_trip() {
+        let values = vec![
+            RespValue::SimpleString("héllo".into()),
+            RespValue::Error("ERR x".into()),
+            RespValue::Integer(i64::MIN),
+            RespValue::BulkString(None),
+            bulk("a\r\nb"),
+            RespValue::BulkString(Some((0..=255u8).collect())),
+            RespValue::Array(None),
+            RespValue::Array(Some(vec![
+                RespValue::Array(Some(vec![RespValue::Integer(1), bulk("x")])),
+                RespValue::Array(None),
+                RespValue::Array(Some(vec![])),
+            ])),
+        ];
+        for v in values {
+            let bytes = v.encode().unwrap();
+            let (parsed, consumed) = RespParser::new(&bytes).parse().unwrap();
+            assert_eq!(parsed, v);
+            assert_eq!(consumed, bytes.len());
+        }
     }
 }
