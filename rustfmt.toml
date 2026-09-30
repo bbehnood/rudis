@@ -1,7 +1,7 @@
 edition = "2024"
 
 # Width & indentation
-max_width = 100
+max_width = 80
 use_small_heuristics = "Max"
 hard_tabs = false
 tab_spaces = 4
