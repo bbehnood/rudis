@@ -52,11 +52,11 @@ impl Command {
 
         let command = values.next().ok_or(CommandError::Empty)?;
 
-        let command = match command {
-            RespValue::BulkString(Some(command)) => command,
-            _ => return Err(CommandError::InvalidCommandName),
+        let RespValue::BulkString(Some(command)) = command else {
+            return Err(CommandError::InvalidCommandName);
         };
 
+        // TODO: Avoid allocation and come up with a better solution
         match command.to_ascii_uppercase().as_slice() {
             b"PING" => Self::parse_ping(values),
             b"ECHO" => Self::parse_echo(values),
