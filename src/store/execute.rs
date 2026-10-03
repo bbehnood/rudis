@@ -1,3 +1,5 @@
+use std::thread::current;
+
 use crate::{Command, RespValue, store::Store};
 
 impl Store {
@@ -28,8 +30,36 @@ impl Store {
                 RespValue::Integer(i64::try_from(count).unwrap_or(i64::MAX))
             },
 
-            Command::Incr(_key) => {
-                todo!()
+            Command::Incr(key) => {
+                let current = match self.get(&key) {
+                    Some(bytes) => {
+                        let parsed = std::str::from_utf8(bytes)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok());
+
+                        match parsed {
+                            Some(n) => n,
+
+                            None => return RespValue::Error(
+                                "ERR value is not an integer or out of range"
+                                    .into(),
+                            ),
+                        }
+                    },
+
+                    None => 0,
+                };
+
+                match current.checked_add(1) {
+                    Some(next) => {
+                        self.set(key, next.to_string().into_bytes());
+                        RespValue::Integer(next)
+                    },
+
+                    None => RespValue::Error(
+                        "ERR increment or decrement would overflow".into(),
+                    ),
+                }
             },
         }
     }
