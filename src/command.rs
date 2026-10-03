@@ -40,6 +40,8 @@ pub enum CommandError {
     InvalidArgument { command: &'static str },
 }
 
+const MAX_COMMAND_LEN: usize = 16;
+
 impl Command {
     pub fn from_resp(value: RespValue) -> Result<Self, CommandError> {
         let values = match value {
@@ -56,8 +58,18 @@ impl Command {
             return Err(CommandError::InvalidCommandName);
         };
 
-        // TODO: Avoid allocation and come up with a better solution
-        match command.to_ascii_uppercase().as_slice() {
+        let mut buf = [0u8; MAX_COMMAND_LEN];
+        let upper: &[u8] = match buf.get_mut(..command.len()) {
+            Some(dst) => {
+                dst.copy_from_slice(&command);
+                dst.make_ascii_uppercase();
+                dst
+            },
+
+            None => return Err(unknown(&command)),
+        };
+
+        match upper {
             b"PING" => Self::parse_ping(values),
             b"ECHO" => Self::parse_echo(values),
             b"GET" => Self::parse_get(values),
@@ -66,11 +78,7 @@ impl Command {
             b"EXISTS" => Self::parse_exists(values),
             b"INCR" => Self::parse_incr(values),
 
-            _ => {
-                let command = String::from_utf8_lossy(&command).into_owned();
-
-                Err(CommandError::UnknownCommand(command))
-            },
+            _ => Err(unknown(&command)),
         }
     }
 
@@ -181,6 +189,10 @@ impl Command {
         })
         .collect()
     }
+}
+
+fn unknown(command: &[u8]) -> CommandError {
+    CommandError::UnknownCommand(String::from_utf8_lossy(command).into_owned())
 }
 
 #[cfg(test)]
