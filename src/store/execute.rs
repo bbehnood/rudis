@@ -19,15 +19,13 @@ impl Store {
             Command::Del(keys) => {
                 let deleted = keys.iter().filter(|key| self.del(key)).count();
 
-                // TODO: Remove explicit cast to i64 as it can wrap around
-                // on a 64-bit target
-                RespValue::Integer(deleted as i64)
+                RespValue::Integer(i64::try_from(deleted).unwrap_or(i64::MAX))
             },
 
             Command::Exists(keys) => {
                 let count = keys.iter().filter(|key| self.exists(key)).count();
 
-                RespValue::Integer(count as i64)
+                RespValue::Integer(i64::try_from(count).unwrap_or(i64::MAX))
             },
 
             Command::Incr(_key) => {
