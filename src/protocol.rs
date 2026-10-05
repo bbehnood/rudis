@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5,7 +6,7 @@ pub enum RespValue {
     SimpleString(String),
     Error(String),
     Integer(i64),
-    BulkString(Option<Vec<u8>>),
+    BulkString(Option<Bytes>),
     Array(Option<Vec<RespValue>>),
 }
 
@@ -148,7 +149,9 @@ impl<'a> RespParser<'a> {
             return Err(ParseError::Incomplete);
         }
 
-        let payload = self.buf[self.pos..self.pos + len].to_vec();
+        let payload =
+            Bytes::copy_from_slice(&self.buf[self.pos..self.pos + len]);
+
         self.pos += len;
 
         self.expect_crlf()?;
@@ -317,593 +320,587 @@ impl RespValue {
 mod tests {
     use super::*;
 
+    // ---------- value constructors ----------
+
+    fn simple(s: &str) -> RespValue {
+        RespValue::SimpleString(s.into())
+    }
+
+    fn error(s: &str) -> RespValue {
+        RespValue::Error(s.into())
+    }
+
+    fn int(n: i64) -> RespValue {
+        RespValue::Integer(n)
+    }
+
+    fn bulk(data: impl AsRef<[u8]>) -> RespValue {
+        RespValue::BulkString(Some(Bytes::copy_from_slice(data.as_ref())))
+    }
+
+    fn null_bulk() -> RespValue {
+        RespValue::BulkString(None)
+    }
+
+    fn array(items: Vec<RespValue>) -> RespValue {
+        RespValue::Array(Some(items))
+    }
+
+    fn null_array() -> RespValue {
+        RespValue::Array(None)
+    }
+
+    // ---------- parse helpers ----------
+
     fn parse(input: &[u8]) -> Result<(RespValue, usize), ParseError> {
         RespParser::new(input).parse()
     }
 
+    /// Parses `input`, asserting it is exactly one complete frame.
+    #[track_caller]
     fn ok(input: &[u8]) -> RespValue {
-        let (v, consumed) = parse(input).expect("expected successful parse");
+        let (value, consumed) =
+            parse(input).expect("expected successful parse");
         assert_eq!(consumed, input.len(), "should consume entire input");
-        v
+        value
     }
 
-    fn bulk(s: &str) -> RespValue {
-        RespValue::BulkString(Some(s.as_bytes().to_vec()))
-    }
-
-    // ---------- Simple strings ----------
-
-    #[test]
-    fn simple_string() {
-        assert_eq!(ok(b"+OK\r\n"), RespValue::SimpleString("OK".into()));
-    }
-
-    #[test]
-    fn simple_string_empty() {
-        assert_eq!(ok(b"+\r\n"), RespValue::SimpleString(String::new()));
-    }
-
-    #[test]
-    fn simple_string_with_spaces_and_unicode() {
+    #[track_caller]
+    fn assert_err(input: &[u8], expected: ParseError) {
         assert_eq!(
-            ok("+héllo wörld\r\n".as_bytes()),
-            RespValue::SimpleString("héllo wörld".into())
+            parse(input),
+            Err(expected),
+            "input: {:?}",
+            String::from_utf8_lossy(input)
         );
     }
 
-    #[test]
-    fn simple_string_invalid_utf8() {
-        assert_eq!(parse(b"+\xff\xfe\r\n"), Err(ParseError::InvalidUtf8));
+    #[track_caller]
+    fn assert_all_err(inputs: &[&[u8]], expected: ParseError) {
+        for input in inputs {
+            assert_err(input, expected);
+        }
     }
 
-    #[test]
-    fn simple_string_bare_cr_or_lf_is_not_terminator() {
-        // A lone \n or \r does not terminate the line.
-        assert_eq!(parse(b"+OK\n"), Err(ParseError::Incomplete));
-        assert_eq!(parse(b"+OK\r"), Err(ParseError::Incomplete));
-    }
-
-    #[test]
-    fn simple_string_embedded_cr_preserved() {
-        assert_eq!(ok(b"+a\rb\r\n"), RespValue::SimpleString("a\rb".into()));
-    }
-
-    // ---------- Errors ----------
-
-    #[test]
-    fn error_value() {
-        assert_eq!(
-            ok(b"-ERR unknown command\r\n"),
-            RespValue::Error("ERR unknown command".into())
-        );
-    }
-
-    #[test]
-    fn error_invalid_utf8() {
-        assert_eq!(parse(b"-\xc3\x28\r\n"), Err(ParseError::InvalidUtf8));
-    }
-
-    // ---------- Integers ----------
-
-    #[test]
-    fn integer_positive_negative_zero() {
-        assert_eq!(ok(b":1000\r\n"), RespValue::Integer(1000));
-        assert_eq!(ok(b":-42\r\n"), RespValue::Integer(-42));
-        assert_eq!(ok(b":0\r\n"), RespValue::Integer(0));
-        assert_eq!(ok(b":+7\r\n"), RespValue::Integer(7));
-    }
-
-    #[test]
-    fn integer_bounds() {
-        assert_eq!(
-            ok(b":9223372036854775807\r\n"),
-            RespValue::Integer(i64::MAX)
-        );
-        assert_eq!(
-            ok(b":-9223372036854775808\r\n"),
-            RespValue::Integer(i64::MIN)
-        );
-    }
-
-    #[test]
-    fn integer_overflow() {
-        assert_eq!(
-            parse(b":9223372036854775808\r\n"),
-            Err(ParseError::InvalidInteger)
-        );
-    }
-
-    #[test]
-    fn integer_invalid() {
-        for input in [
-            &b":\r\n"[..],
-            b":abc\r\n",
-            b":12a\r\n",
-            b":1 2\r\n",
-            b": 1\r\n",
-            b":1.5\r\n",
-            b":\xff\r\n",
-        ] {
+    /// Asserts that `frame` parses, and that every strict prefix of it is
+    /// reported as `Incomplete` (never an error, never a bogus success).
+    #[track_caller]
+    fn assert_prefixes_incomplete(frame: &[u8]) {
+        for len in 0..frame.len() {
             assert_eq!(
-                parse(input),
-                Err(ParseError::InvalidInteger),
-                "input: {:?}",
-                String::from_utf8_lossy(input)
+                parse(&frame[..len]),
+                Err(ParseError::Incomplete),
+                "prefix length {len} of {:?}",
+                String::from_utf8_lossy(frame)
             );
         }
+
+        assert!(parse(frame).is_ok(), "full frame should parse");
     }
 
-    // ---------- Bulk strings ----------
-
-    #[test]
-    fn bulk_string_basic() {
-        assert_eq!(ok(b"$5\r\nhello\r\n"), bulk("hello"));
-    }
-
-    #[test]
-    fn bulk_string_empty() {
-        assert_eq!(ok(b"$0\r\n\r\n"), RespValue::BulkString(Some(vec![])));
-    }
-
-    #[test]
-    fn bulk_string_null() {
-        assert_eq!(ok(b"$-1\r\n"), RespValue::BulkString(None));
-    }
-
-    #[test]
-    fn bulk_string_binary_safe() {
-        assert_eq!(
-            ok(b"$6\r\n\x00\xff\r\n\x01\x02\r\n"),
-            RespValue::BulkString(Some(vec![
-                0x00, 0xff, b'\r', b'\n', 0x01, 0x02
-            ]))
-        );
-    }
-
-    #[test]
-    fn bulk_string_payload_containing_crlf() {
-        assert_eq!(ok(b"$4\r\na\r\nb\r\n"), bulk("a\r\nb"));
-    }
-
-    #[test]
-    fn bulk_string_consumed_count_with_trailing_data() {
-        let input = b"$3\r\nfoo\r\n+extra\r\n";
-        let (v, consumed) = parse(input).unwrap();
-        assert_eq!(v, bulk("foo"));
-        assert_eq!(consumed, 9);
-    }
-
-    #[test]
-    fn bulk_string_missing_crlf() {
-        assert_eq!(parse(b"$3\r\nfooXY"), Err(ParseError::MissingCrlf));
-    }
-
-    #[test]
-    fn bulk_string_length_mismatch_too_long_payload() {
-        // Declared 3 but 5 bytes of payload precede the CRLF.
-        assert_eq!(parse(b"$3\r\nhello\r\n"), Err(ParseError::MissingCrlf));
-    }
-
-    #[test]
-    fn bulk_string_truncated_payload() {
-        assert_eq!(parse(b"$5\r\nhel"), Err(ParseError::Incomplete));
-        assert_eq!(parse(b"$5\r\nhello"), Err(ParseError::Incomplete));
-        assert_eq!(parse(b"$5\r\nhello\r"), Err(ParseError::Incomplete));
-    }
-
-    #[test]
-    fn bulk_string_invalid_length() {
-        for input in [
-            &b"$abc\r\n"[..],
-            b"$\r\n",
-            b"$-2\r\n",
-            b"$-100\r\n",
-            b"$1.5\r\n",
-            b"$\xff\r\n",
-        ] {
-            assert_eq!(
-                parse(input),
-                Err(ParseError::InvalidLength),
-                "input: {:?}",
-                String::from_utf8_lossy(input)
-            );
-        }
-    }
-
-    #[test]
-    fn bulk_string_too_large() {
-        let input = format!("${}\r\n", MAX_BULK_LEN + 1);
-        assert_eq!(parse(input.as_bytes()), Err(ParseError::TooLarge));
-    }
-
-    #[test]
-    fn bulk_string_at_limit_is_incomplete_not_too_large() {
-        let input = format!("${}\r\n", MAX_BULK_LEN);
-        assert_eq!(parse(input.as_bytes()), Err(ParseError::Incomplete));
-    }
-
-    #[test]
-    fn bulk_string_huge_length_does_not_panic() {
-        // Larger than i64: fails integer parse.
-        assert_eq!(
-            parse(b"$99999999999999999999\r\n"),
-            Err(ParseError::InvalidLength)
-        );
-        assert_eq!(
-            parse(b"$9223372036854775807\r\n"),
-            Err(ParseError::TooLarge)
-        );
-    }
-
-    // ---------- Arrays ----------
-
-    #[test]
-    fn array_empty() {
-        assert_eq!(ok(b"*0\r\n"), RespValue::Array(Some(vec![])));
-    }
-
-    #[test]
-    fn array_null() {
-        assert_eq!(ok(b"*-1\r\n"), RespValue::Array(None));
-    }
-
-    #[test]
-    fn array_of_bulk_strings() {
-        assert_eq!(
-            ok(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"),
-            RespValue::Array(Some(vec![bulk("foo"), bulk("bar")]))
-        );
-    }
-
-    #[test]
-    fn array_mixed_types() {
-        assert_eq!(
-            ok(b"*5\r\n:1\r\n+two\r\n-three\r\n$4\r\nfour\r\n$-1\r\n"),
-            RespValue::Array(Some(vec![
-                RespValue::Integer(1),
-                RespValue::SimpleString("two".into()),
-                RespValue::Error("three".into()),
-                bulk("four"),
-                RespValue::BulkString(None),
-            ]))
-        );
-    }
-
-    #[test]
-    fn array_nested() {
-        assert_eq!(
-            ok(b"*2\r\n*2\r\n:1\r\n:2\r\n*1\r\n*0\r\n"),
-            RespValue::Array(Some(vec![
-                RespValue::Array(Some(vec![
-                    RespValue::Integer(1),
-                    RespValue::Integer(2)
-                ])),
-                RespValue::Array(Some(vec![RespValue::Array(Some(vec![]))])),
-            ]))
-        );
-    }
-
-    #[test]
-    fn array_containing_null_array() {
-        assert_eq!(
-            ok(b"*1\r\n*-1\r\n"),
-            RespValue::Array(Some(vec![RespValue::Array(None)]))
-        );
-    }
-
-    #[test]
-    fn array_typical_redis_command() {
-        assert_eq!(
-            ok(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"),
-            RespValue::Array(Some(vec![
-                bulk("SET"),
-                bulk("key"),
-                bulk("value")
-            ]))
-        );
-    }
-
-    #[test]
-    fn array_invalid_length() {
-        for input in [&b"*abc\r\n"[..], b"*\r\n", b"*-2\r\n", b"*1.0\r\n"] {
-            assert_eq!(
-                parse(input),
-                Err(ParseError::InvalidLength),
-                "input: {:?}",
-                String::from_utf8_lossy(input)
-            );
-        }
-    }
-
-    #[test]
-    fn array_too_large() {
-        let input = format!("*{}\r\n", MAX_ARRAY_LEN + 1);
-        assert_eq!(parse(input.as_bytes()), Err(ParseError::TooLarge));
-    }
-
-    #[test]
-    fn array_fewer_elements_than_declared_is_incomplete() {
-        assert_eq!(parse(b"*3\r\n:1\r\n:2\r\n"), Err(ParseError::Incomplete));
-    }
-
-    #[test]
-    fn array_element_error_propagates() {
-        assert_eq!(
-            parse(b"*2\r\n:1\r\n?bad\r\n"),
-            Err(ParseError::InvalidType(b'?'))
-        );
-        assert_eq!(
-            parse(b"*2\r\n:1\r\n:xyz\r\n"),
-            Err(ParseError::InvalidInteger)
-        );
-    }
-
-    #[test]
-    fn array_trailing_data_not_consumed() {
-        let input = b"*1\r\n:1\r\n:2\r\n";
-        let (v, consumed) = parse(input).unwrap();
-        assert_eq!(v, RespValue::Array(Some(vec![RespValue::Integer(1)])));
-        assert_eq!(consumed, 8);
-    }
-
-    #[test]
-    fn huge_array_header_without_a_body_is_incomplete() {
-        let input = format!("*{MAX_ARRAY_LEN}\r\n");
-        assert_eq!(parse(&input.as_bytes()), Err(ParseError::Incomplete));
-    }
-
-    // ---------- Depth limit ----------
-
-    fn nested(levels: usize) -> Vec<u8> {
-        // `levels` nested single-element arrays, innermost is an empty array.
-        let mut buf = Vec::new();
-        for _ in 0..levels {
-            buf.extend_from_slice(b"*1\r\n");
-        }
+    /// `levels` nested single-element arrays; the innermost is an empty array.
+    fn nested_frame(levels: usize) -> Vec<u8> {
+        let mut buf = b"*1\r\n".repeat(levels);
         buf.extend_from_slice(b"*0\r\n");
         buf
     }
 
-    #[test]
-    fn depth_at_limit_ok() {
-        // Outer array is depth 0; innermost empty array sits at MAX_DEPTH.
-        let buf = nested(MAX_DEPTH);
-        assert!(parse(&buf).is_ok());
+    /// The same shape as `nested_frame`, as a value (for the encoder).
+    fn nested_value(levels: usize) -> RespValue {
+        (0..levels).fold(array(vec![]), |inner, _| array(vec![inner]))
     }
 
-    #[test]
-    fn depth_over_limit_rejected() {
-        let buf = nested(MAX_DEPTH + 1);
-        assert_eq!(parse(&buf), Err(ParseError::TooDeep));
-    }
+    // ======================================================================
+    // Parsing
+    // ======================================================================
 
-    #[test]
-    fn very_deep_nesting_does_not_overflow_stack() {
-        let buf = nested(100_000);
-        assert_eq!(parse(&buf), Err(ParseError::TooDeep));
-    }
+    mod simple_and_error {
+        use super::*;
 
-    // ---------- Type byte / framing ----------
-
-    #[test]
-    fn empty_input_is_incomplete() {
-        assert_eq!(parse(b""), Err(ParseError::Incomplete));
-    }
-
-    #[test]
-    fn invalid_type_byte() {
-        assert_eq!(parse(b"?foo\r\n"), Err(ParseError::InvalidType(b'?')));
-        assert_eq!(parse(b"\r\n"), Err(ParseError::InvalidType(b'\r')));
-        assert_eq!(parse(b"\x00"), Err(ParseError::InvalidType(0)));
-    }
-
-    #[test]
-    fn type_byte_only_is_incomplete() {
-        for input in [&b"+"[..], b"-", b":", b"$", b"*"] {
-            assert_eq!(parse(input), Err(ParseError::Incomplete));
+        #[test]
+        fn simple_string() {
+            assert_eq!(ok(b"+OK\r\n"), simple("OK"));
+            assert_eq!(ok(b"+\r\n"), simple(""));
         }
-    }
 
-    #[test]
-    fn every_strict_prefix_of_a_frame_is_incomplete() {
-        let frame = b"*3\r\n$3\r\nSET\r\n:42\r\n+OK\r\n";
-        for i in 0..frame.len() {
+        #[test]
+        fn simple_string_with_spaces_and_unicode() {
             assert_eq!(
-                parse(&frame[..i]),
-                Err(ParseError::Incomplete),
-                "prefix length {i}"
+                ok("+héllo wörld\r\n".as_bytes()),
+                simple("héllo wörld")
             );
         }
-        assert!(parse(frame).is_ok());
-    }
 
-    #[test]
-    fn pipelined_frames_parse_sequentially() {
-        let input = b"+OK\r\n:5\r\n$2\r\nhi\r\n";
-        let mut offset = 0;
-        let mut out = Vec::new();
-        while offset < input.len() {
-            let (v, n) = parse(&input[offset..]).unwrap();
-            out.push(v);
-            offset += n;
+        #[test]
+        fn simple_string_embedded_cr_preserved() {
+            assert_eq!(ok(b"+a\rb\r\n"), simple("a\rb"));
         }
-        assert_eq!(
-            out,
-            vec![
-                RespValue::SimpleString("OK".into()),
-                RespValue::Integer(5),
-                bulk("hi"),
-            ]
-        );
+
+        #[test]
+        fn bare_cr_or_lf_is_not_a_terminator() {
+            assert_all_err(&[b"+OK\n", b"+OK\r"], ParseError::Incomplete);
+        }
+
+        #[test]
+        fn error_value() {
+            assert_eq!(
+                ok(b"-ERR unknown command\r\n"),
+                error("ERR unknown command")
+            );
+        }
+
+        #[test]
+        fn invalid_utf8_is_rejected() {
+            assert_all_err(
+                &[b"+\xff\xfe\r\n", b"-\xc3\x28\r\n"],
+                ParseError::InvalidUtf8,
+            );
+        }
     }
 
-    #[test]
-    fn error_display_messages() {
-        assert_eq!(ParseError::Incomplete.to_string(), "incomplete frame");
-        assert_eq!(
-            ParseError::InvalidType(b'?').to_string(),
-            "invalid type byte: 63"
-        );
-        assert_eq!(ParseError::TooDeep.to_string(), "frame nested too deeply");
+    mod integer {
+        use super::*;
+
+        #[test]
+        fn signs_and_zero() {
+            let cases: [(&[u8], i64); 4] = [
+                (b":1000\r\n", 1000),
+                (b":-42\r\n", -42),
+                (b":0\r\n", 0),
+                (b":+7\r\n", 7),
+            ];
+
+            for (input, expected) in cases {
+                assert_eq!(ok(input), int(expected));
+            }
+        }
+
+        #[test]
+        fn bounds() {
+            assert_eq!(ok(b":9223372036854775807\r\n"), int(i64::MAX));
+            assert_eq!(ok(b":-9223372036854775808\r\n"), int(i64::MIN));
+        }
+
+        #[test]
+        fn invalid() {
+            assert_all_err(
+                &[
+                    b":\r\n",
+                    b":abc\r\n",
+                    b":12a\r\n",
+                    b":1 2\r\n",
+                    b": 1\r\n",
+                    b":1.5\r\n",
+                    b":\xff\r\n",
+                    // One past i64::MAX / one below i64::MIN.
+                    b":9223372036854775808\r\n",
+                    b":-9223372036854775809\r\n",
+                ],
+                ParseError::InvalidInteger,
+            );
+        }
     }
 
-    // ---------- Line limit ----------
+    mod bulk {
+        use super::*;
 
-    #[test]
-    fn line_at_limit_is_ok() {
-        let mut input = vec![b'+'];
-        input.extend(std::iter::repeat(b'a').take(MAX_LINE_LEN));
-        input.extend_from_slice(b"\r\n");
-        assert!(parse(&input).is_ok());
+        #[test]
+        fn basic_empty_and_null() {
+            assert_eq!(ok(b"$5\r\nhello\r\n"), bulk("hello"));
+            assert_eq!(ok(b"$0\r\n\r\n"), bulk(""));
+            assert_eq!(ok(b"$-1\r\n"), null_bulk());
+        }
+
+        #[test]
+        fn empty_is_not_null() {
+            assert_ne!(ok(b"$0\r\n\r\n"), ok(b"$-1\r\n"));
+        }
+
+        #[test]
+        fn binary_safe() {
+            assert_eq!(
+                ok(b"$6\r\n\x00\xff\r\n\x01\x02\r\n"),
+                bulk([0x00, 0xff, b'\r', b'\n', 0x01, 0x02])
+            );
+        }
+
+        #[test]
+        fn payload_containing_crlf() {
+            assert_eq!(ok(b"$4\r\na\r\nb\r\n"), bulk("a\r\nb"));
+        }
+
+        #[test]
+        fn consumed_count_with_trailing_data() {
+            let (value, consumed) = parse(b"$3\r\nfoo\r\n+extra\r\n").unwrap();
+            assert_eq!(value, bulk("foo"));
+            assert_eq!(consumed, 9);
+        }
+
+        #[test]
+        fn missing_or_misplaced_crlf() {
+            // Wrong terminator bytes.
+            assert_err(b"$3\r\nfooXY", ParseError::MissingCrlf);
+            // Declared 3 but 5 bytes of payload precede the CRLF.
+            assert_err(b"$3\r\nhello\r\n", ParseError::MissingCrlf);
+        }
+
+        #[test]
+        fn truncated_payload_is_incomplete() {
+            assert_all_err(
+                &[b"$5\r\nhel", b"$5\r\nhello", b"$5\r\nhello\r"],
+                ParseError::Incomplete,
+            );
+        }
+
+        #[test]
+        fn invalid_length() {
+            assert_all_err(
+                &[
+                    b"$abc\r\n",
+                    b"$\r\n",
+                    b"$-2\r\n",
+                    b"$-100\r\n",
+                    b"$1.5\r\n",
+                    b"$\xff\r\n",
+                    // Larger than i64, so it fails integer parsing.
+                    b"$99999999999999999999\r\n",
+                ],
+                ParseError::InvalidLength,
+            );
+        }
+
+        #[test]
+        fn too_large() {
+            let over = format!("${}\r\n", MAX_BULK_LEN + 1);
+            assert_err(over.as_bytes(), ParseError::TooLarge);
+
+            // Fits in i64 but is absurd; must not panic or try to allocate.
+            assert_err(b"$9223372036854775807\r\n", ParseError::TooLarge);
+        }
+
+        #[test]
+        fn at_limit_is_incomplete_not_too_large() {
+            let at = format!("${MAX_BULK_LEN}\r\n");
+            assert_err(at.as_bytes(), ParseError::Incomplete);
+        }
     }
 
-    #[test]
-    fn line_over_limit_is_too_large() {
-        let mut input = vec![b'+'];
-        input.extend(std::iter::repeat(b'a').take(MAX_LINE_LEN + 1));
-        input.extend_from_slice(b"\r\n");
-        assert_eq!(parse(&input), Err(ParseError::TooLarge));
+    mod array {
+        use super::*;
+
+        #[test]
+        fn empty_and_null() {
+            assert_eq!(ok(b"*0\r\n"), array(vec![]));
+            assert_eq!(ok(b"*-1\r\n"), null_array());
+        }
+
+        #[test]
+        fn of_bulk_strings() {
+            assert_eq!(
+                ok(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"),
+                array(vec![bulk("foo"), bulk("bar")])
+            );
+        }
+
+        #[test]
+        fn typical_redis_command() {
+            assert_eq!(
+                ok(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"),
+                array(vec![bulk("SET"), bulk("key"), bulk("value")])
+            );
+        }
+
+        #[test]
+        fn mixed_types() {
+            assert_eq!(
+                ok(b"*5\r\n:1\r\n+two\r\n-three\r\n$4\r\nfour\r\n$-1\r\n"),
+                array(vec![
+                    int(1),
+                    simple("two"),
+                    error("three"),
+                    bulk("four"),
+                    null_bulk(),
+                ])
+            );
+        }
+
+        #[test]
+        fn nested() {
+            assert_eq!(
+                ok(b"*2\r\n*2\r\n:1\r\n:2\r\n*1\r\n*0\r\n"),
+                array(vec![
+                    array(vec![int(1), int(2)]),
+                    array(vec![array(vec![])]),
+                ])
+            );
+        }
+
+        #[test]
+        fn containing_null_array() {
+            assert_eq!(ok(b"*1\r\n*-1\r\n"), array(vec![null_array()]));
+        }
+
+        #[test]
+        fn invalid_length() {
+            assert_all_err(
+                &[b"*abc\r\n", b"*\r\n", b"*-2\r\n", b"*1.0\r\n"],
+                ParseError::InvalidLength,
+            );
+        }
+
+        #[test]
+        fn too_large() {
+            let over = format!("*{}\r\n", MAX_ARRAY_LEN + 1);
+            assert_err(over.as_bytes(), ParseError::TooLarge);
+        }
+
+        #[test]
+        fn fewer_elements_than_declared_is_incomplete() {
+            assert_err(b"*3\r\n:1\r\n:2\r\n", ParseError::Incomplete);
+        }
+
+        #[test]
+        fn max_length_header_without_body_is_incomplete() {
+            // Declares the largest allowed array but sends no elements. This must
+            // report `Incomplete` without pre-allocating for a million elements.
+            let header = format!("*{MAX_ARRAY_LEN}\r\n");
+            assert_err(header.as_bytes(), ParseError::Incomplete);
+        }
+
+        #[test]
+        fn element_error_propagates() {
+            assert_err(b"*2\r\n:1\r\n?bad\r\n", ParseError::InvalidType(b'?'));
+            assert_err(b"*2\r\n:1\r\n:xyz\r\n", ParseError::InvalidInteger);
+        }
+
+        #[test]
+        fn trailing_data_not_consumed() {
+            let (value, consumed) = parse(b"*1\r\n:1\r\n:2\r\n").unwrap();
+            assert_eq!(value, array(vec![int(1)]));
+            assert_eq!(consumed, 8);
+        }
     }
 
-    #[test]
-    fn unterminated_oversized_line_is_too_large_without_crlf() {
-        let mut input = vec![b'+'];
-        input.extend(std::iter::repeat(b'a').take(MAX_LINE_LEN + 2));
-        assert_eq!(parse(&input), Err(ParseError::TooLarge));
+    mod depth {
+        use super::*;
+
+        #[test]
+        fn at_limit_is_ok() {
+            // The outer array is depth 0; the innermost sits at MAX_DEPTH.
+            assert!(parse(&nested_frame(MAX_DEPTH)).is_ok());
+        }
+
+        #[test]
+        fn over_limit_is_rejected() {
+            assert_err(&nested_frame(MAX_DEPTH + 1), ParseError::TooDeep);
+        }
+
+        #[test]
+        fn very_deep_nesting_does_not_overflow_the_stack() {
+            assert_err(&nested_frame(100_000), ParseError::TooDeep);
+        }
     }
 
-    #[test]
-    fn unterminated_short_line_is_incomplete() {
-        assert_eq!(parse(b"+abc"), Err(ParseError::Incomplete));
+    mod framing {
+        use super::*;
+
+        #[test]
+        fn empty_input_is_incomplete() {
+            assert_err(b"", ParseError::Incomplete);
+        }
+
+        #[test]
+        fn type_byte_only_is_incomplete() {
+            assert_all_err(
+                &[b"+", b"-", b":", b"$", b"*"],
+                ParseError::Incomplete,
+            );
+        }
+
+        #[test]
+        fn invalid_type_byte() {
+            assert_err(b"?foo\r\n", ParseError::InvalidType(b'?'));
+            assert_err(b"\r\n", ParseError::InvalidType(b'\r'));
+            assert_err(b"\x00", ParseError::InvalidType(0));
+        }
+
+        #[test]
+        fn every_strict_prefix_of_a_frame_is_incomplete() {
+            let frames: &[&[u8]] = &[
+                b"+OK\r\n",
+                b"-ERR x\r\n",
+                b":42\r\n",
+                b"$5\r\nhello\r\n",
+                b"$-1\r\n",
+                b"*3\r\n$3\r\nSET\r\n:42\r\n+OK\r\n",
+                b"*2\r\n*1\r\n:1\r\n*0\r\n",
+            ];
+
+            for frame in frames {
+                assert_prefixes_incomplete(frame);
+            }
+        }
+
+        #[test]
+        fn pipelined_frames_parse_sequentially() {
+            let input = b"+OK\r\n:5\r\n$2\r\nhi\r\n";
+            let mut offset = 0;
+            let mut parsed = Vec::new();
+
+            while offset < input.len() {
+                let (value, used) = parse(&input[offset..]).unwrap();
+                parsed.push(value);
+                offset += used;
+            }
+
+            assert_eq!(parsed, vec![simple("OK"), int(5), bulk("hi")]);
+        }
+
+        #[test]
+        fn parse_error_display_messages() {
+            assert_eq!(ParseError::Incomplete.to_string(), "incomplete frame");
+            assert_eq!(
+                ParseError::InvalidType(b'?').to_string(),
+                "invalid type byte: 63"
+            );
+            assert_eq!(
+                ParseError::TooDeep.to_string(),
+                "frame nested too deeply"
+            );
+        }
     }
-}
 
-#[cfg(test)]
-mod encode_tests {
-    use super::*;
+    // ======================================================================
+    // Encoding
+    // ======================================================================
 
-    fn bulk(s: &str) -> RespValue {
-        RespValue::BulkString(Some(s.as_bytes().to_vec()))
-    }
+    mod encode {
+        use super::*;
 
-    #[test]
-    fn encodes_each_type() {
-        let cases: Vec<(RespValue, &[u8])> = vec![
-            (RespValue::SimpleString("OK".into()), b"+OK\r\n"),
-            (RespValue::SimpleString(String::new()), b"+\r\n"),
-            (RespValue::Error("ERR bad".into()), b"-ERR bad\r\n"),
-            (RespValue::Integer(0), b":0\r\n"),
-            (RespValue::Integer(-42), b":-42\r\n"),
-            (RespValue::Integer(i64::MAX), b":9223372036854775807\r\n"),
-            (RespValue::Integer(i64::MIN), b":-9223372036854775808\r\n"),
-            (bulk("hello"), b"$5\r\nhello\r\n"),
-            (RespValue::BulkString(Some(vec![])), b"$0\r\n\r\n"),
-            (RespValue::BulkString(None), b"$-1\r\n"),
-            (RespValue::Array(None), b"*-1\r\n"),
-            (RespValue::Array(Some(vec![])), b"*0\r\n"),
-        ];
-        for (value, expected) in cases {
+        #[track_caller]
+        fn assert_encodes(value: &RespValue, expected: &[u8]) {
             assert_eq!(value.encode().unwrap(), expected, "{value:?}");
         }
-    }
 
-    #[test]
-    fn encodes_nested_array() {
-        let v = RespValue::Array(Some(vec![
-            bulk("SET"),
-            RespValue::Array(Some(vec![RespValue::Integer(1)])),
-            RespValue::BulkString(None),
-        ]));
-        assert_eq!(
-            v.encode().unwrap(),
-            b"*3\r\n$3\r\nSET\r\n*1\r\n:1\r\n$-1\r\n"
-        );
-    }
+        #[test]
+        fn each_type() {
+            let cases: Vec<(RespValue, &[u8])> = vec![
+                (simple("OK"), b"+OK\r\n"),
+                (simple(""), b"+\r\n"),
+                (error("ERR bad"), b"-ERR bad\r\n"),
+                (int(0), b":0\r\n"),
+                (int(-42), b":-42\r\n"),
+                (int(i64::MAX), b":9223372036854775807\r\n"),
+                (int(i64::MIN), b":-9223372036854775808\r\n"),
+                (bulk("hello"), b"$5\r\nhello\r\n"),
+                (bulk(""), b"$0\r\n\r\n"),
+                (null_bulk(), b"$-1\r\n"),
+                (null_array(), b"*-1\r\n"),
+                (array(vec![]), b"*0\r\n"),
+            ];
 
-    #[test]
-    fn bulk_string_is_binary_safe() {
-        let v = RespValue::BulkString(Some(vec![0, b'\r', b'\n', 0xff]));
-        assert_eq!(v.encode().unwrap(), b"$4\r\n\x00\r\n\xff\r\n");
-    }
+            for (value, expected) in &cases {
+                assert_encodes(value, expected);
+            }
+        }
 
-    #[test]
-    fn rejects_crlf_in_simple_string_and_error() {
-        for s in ["a\r\nb", "a\rb", "a\nb"] {
-            assert_eq!(
-                RespValue::SimpleString(s.into()).encode(),
-                Err(EncodeError::InvalidString)
-            );
-            assert_eq!(
-                RespValue::Error(s.into()).encode(),
-                Err(EncodeError::InvalidString)
+        #[test]
+        fn nested_array() {
+            let value =
+                array(vec![bulk("SET"), array(vec![int(1)]), null_bulk()]);
+
+            assert_encodes(&value, b"*3\r\n$3\r\nSET\r\n*1\r\n:1\r\n$-1\r\n");
+        }
+
+        #[test]
+        fn bulk_string_is_binary_safe() {
+            assert_encodes(
+                &bulk([0, b'\r', b'\n', 0xff]),
+                b"$4\r\n\x00\r\n\xff\r\n",
             );
         }
-    }
 
-    #[test]
-    fn error_leaves_buffer_unchanged() {
-        let mut out = b"prefix".to_vec();
-        let v = RespValue::Array(Some(vec![
-            RespValue::Integer(1),
-            RespValue::SimpleString("bad\r\n".into()),
-        ]));
-        assert_eq!(v.encode_into(&mut out), Err(EncodeError::InvalidString));
-        assert_eq!(out, b"prefix");
-    }
-
-    #[test]
-    fn encode_into_appends() {
-        let mut out = Vec::new();
-        RespValue::SimpleString("OK".into())
-            .encode_into(&mut out)
-            .unwrap();
-        RespValue::Integer(5).encode_into(&mut out).unwrap();
-        assert_eq!(out, b"+OK\r\n:5\r\n");
-    }
-
-    #[test]
-    fn depth_limit_matches_parser() {
-        let build = |levels: usize| {
-            let mut v = RespValue::Array(Some(vec![]));
-            for _ in 0..levels {
-                v = RespValue::Array(Some(vec![v]));
+        #[test]
+        fn rejects_crlf_in_simple_string_and_error() {
+            for s in ["a\r\nb", "a\rb", "a\nb"] {
+                assert_eq!(simple(s).encode(), Err(EncodeError::InvalidString));
+                assert_eq!(error(s).encode(), Err(EncodeError::InvalidString));
             }
-            v
-        };
-        assert!(build(MAX_DEPTH).encode().is_ok());
-        assert_eq!(build(MAX_DEPTH + 1).encode(), Err(EncodeError::TooDeep));
-    }
+        }
 
-    #[test]
-    fn array_length_limit() {
-        let v = RespValue::Array(Some(vec![
-            RespValue::Integer(0);
-            MAX_ARRAY_LEN + 1
-        ]));
-        assert_eq!(v.encode(), Err(EncodeError::TooLarge));
-    }
+        #[test]
+        fn failed_encode_leaves_buffer_unchanged() {
+            let mut out = b"prefix".to_vec();
+            let value = array(vec![int(1), simple("bad\r\n")]);
 
-    #[test]
-    fn round_trip() {
-        let values = vec![
-            RespValue::SimpleString("héllo".into()),
-            RespValue::Error("ERR x".into()),
-            RespValue::Integer(i64::MIN),
-            RespValue::BulkString(None),
-            bulk("a\r\nb"),
-            RespValue::BulkString(Some((0..=255u8).collect())),
-            RespValue::Array(None),
-            RespValue::Array(Some(vec![
-                RespValue::Array(Some(vec![RespValue::Integer(1), bulk("x")])),
-                RespValue::Array(None),
-                RespValue::Array(Some(vec![])),
-            ])),
-        ];
-        for v in values {
-            let bytes = v.encode().unwrap();
-            let (parsed, consumed) = RespParser::new(&bytes).parse().unwrap();
-            assert_eq!(parsed, v);
-            assert_eq!(consumed, bytes.len());
+            assert_eq!(
+                value.encode_into(&mut out),
+                Err(EncodeError::InvalidString)
+            );
+            assert_eq!(out, b"prefix");
+        }
+
+        #[test]
+        fn encode_into_appends() {
+            let mut out = Vec::new();
+            simple("OK").encode_into(&mut out).unwrap();
+            int(5).encode_into(&mut out).unwrap();
+
+            assert_eq!(out, b"+OK\r\n:5\r\n");
+        }
+
+        #[test]
+        fn depth_limit_matches_parser() {
+            assert!(nested_value(MAX_DEPTH).encode().is_ok());
+            assert_eq!(
+                nested_value(MAX_DEPTH + 1).encode(),
+                Err(EncodeError::TooDeep)
+            );
+        }
+
+        #[test]
+        fn array_length_limit() {
+            let value = array(vec![int(0); MAX_ARRAY_LEN + 1]);
+
+            assert_eq!(value.encode(), Err(EncodeError::TooLarge));
+        }
+
+        #[test]
+        fn encode_error_display_messages() {
+            assert_eq!(
+                EncodeError::InvalidString.to_string(),
+                "simple string/error contains CR or LF"
+            );
+            assert_eq!(
+                EncodeError::TooDeep.to_string(),
+                "value nested too deeply"
+            );
+        }
+
+        #[test]
+        fn round_trip() {
+            let values = vec![
+                simple("héllo"),
+                error("ERR x"),
+                int(i64::MIN),
+                null_bulk(),
+                bulk("a\r\nb"),
+                bulk((0..=255u8).collect::<Vec<_>>()),
+                null_array(),
+                array(vec![
+                    array(vec![int(1), bulk("x")]),
+                    null_array(),
+                    array(vec![]),
+                ]),
+            ];
+
+            for value in values {
+                let bytes = value.encode().unwrap();
+                let (parsed, consumed) = parse(&bytes).unwrap();
+
+                assert_eq!(parsed, value);
+                assert_eq!(consumed, bytes.len());
+            }
         }
     }
 }

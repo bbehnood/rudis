@@ -1,5 +1,6 @@
 use std::collections::hash_map::Entry;
 
+use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{Command, RespValue, store::Store};
@@ -20,9 +21,7 @@ impl Store {
 
             Command::Echo(msg) => RespValue::BulkString(Some(msg)),
 
-            Command::Get(key) => {
-                RespValue::BulkString(self.get(&key).map(<[u8]>::to_vec))
-            },
+            Command::Get(key) => RespValue::BulkString(self.get(&key)),
 
             Command::Set { key, value } => {
                 self.set(key, value);
@@ -48,7 +47,7 @@ impl Store {
         }
     }
 
-    fn incr(&mut self, key: Vec<u8>) -> Result<i64, ExecuteError> {
+    fn incr(&mut self, key: Bytes) -> Result<i64, ExecuteError> {
         match self.data.entry(key) {
             Entry::Occupied(mut entry) => {
                 let current = parse_redis_i64(entry.get())
@@ -57,13 +56,13 @@ impl Store {
                 let next =
                     current.checked_add(1).ok_or(ExecuteError::Overflow)?;
 
-                *entry.get_mut() = next.to_string().into_bytes();
+                *entry.get_mut() = Bytes::from(next.to_string().into_bytes());
 
                 Ok(next)
             },
 
             Entry::Vacant(entry) => {
-                entry.insert(b"1".to_vec());
+                entry.insert(Bytes::from_static(b"1"));
 
                 Ok(1)
             },

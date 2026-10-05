@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use thiserror::Error;
 
 use crate::RespValue;
@@ -5,15 +6,15 @@ use crate::RespValue;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Ping,
-    Echo(Vec<u8>),
+    Echo(Bytes),
 
-    Get(Vec<u8>),
-    Set { key: Vec<u8>, value: Vec<u8> },
-    Del(Vec<Vec<u8>>),
+    Get(Bytes),
+    Set { key: Bytes, value: Bytes },
+    Del(Vec<Bytes>),
 
-    Exists(Vec<Vec<u8>>),
+    Exists(Vec<Bytes>),
 
-    Incr(Vec<u8>),
+    Incr(Bytes),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -168,7 +169,7 @@ impl Command {
     fn bulk_arg(
         args: &mut impl Iterator<Item = RespValue>,
         command: &'static str,
-    ) -> Result<Vec<u8>, CommandError> {
+    ) -> Result<Bytes, CommandError> {
         match args.next() {
             Some(RespValue::BulkString(Some(value))) => Ok(value),
 
@@ -181,7 +182,7 @@ impl Command {
     fn bulk_args(
         args: impl Iterator<Item = RespValue>,
         command: &'static str,
-    ) -> Result<Vec<Vec<u8>>, CommandError> {
+    ) -> Result<Vec<Bytes>, CommandError> {
         args.map(|value| match value {
             RespValue::BulkString(Some(value)) => Ok(value),
 
@@ -202,7 +203,7 @@ mod tests {
     // ---------- helpers ----------
 
     fn bulk(s: &[u8]) -> RespValue {
-        RespValue::BulkString(Some(s.to_vec()))
+        RespValue::BulkString(Some(Bytes::copy_from_slice(s)))
     }
 
     fn request(parts: &[&str]) -> RespValue {
@@ -215,8 +216,8 @@ mod tests {
         Command::from_resp(request(parts))
     }
 
-    fn b(s: &str) -> Vec<u8> {
-        s.as_bytes().to_vec()
+    fn b(s: &str) -> Bytes {
+        Bytes::copy_from_slice(s.as_bytes())
     }
 
     // ---------- happy paths ----------
@@ -298,24 +299,27 @@ mod tests {
 
     #[test]
     fn keys_and_values_may_be_arbitrary_bytes() {
-        let key = vec![0x00, 0xff, 0xfe, b'\r', b'\n'];
-        let value = vec![0x80, 0x00, 0x7f];
+        let key: &[u8] = &[0x00, 0xff, 0xfe, b'\r', b'\n'];
+        let value: &[u8] = &[0x80, 0x00, 0x7f];
 
-        let req = RespValue::Array(Some(vec![
-            bulk(b"SET"),
-            bulk(&key),
-            bulk(&value),
-        ]));
+        let req =
+            RespValue::Array(Some(vec![bulk(b"SET"), bulk(key), bulk(value)]));
 
-        assert_eq!(Command::from_resp(req), Ok(Command::Set { key, value }));
+        assert_eq!(
+            Command::from_resp(req),
+            Ok(Command::Set {
+                key: Bytes::copy_from_slice(key),
+                value: Bytes::copy_from_slice(value),
+            })
+        );
     }
 
     #[test]
     fn empty_bulk_string_arguments_are_valid() {
-        assert_eq!(parse(&["GET", ""]), Ok(Command::Get(vec![])));
+        assert_eq!(parse(&["GET", ""]), Ok(Command::Get(Bytes::new())));
         assert_eq!(
             parse(&["SET", "", ""]),
-            Ok(Command::Set { key: vec![], value: vec![] })
+            Ok(Command::Set { key: Bytes::new(), value: Bytes::new() })
         );
     }
 

@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
+use bytes::Bytes;
+
 mod execute;
 
 pub struct Store {
-    data: HashMap<Vec<u8>, Vec<u8>>,
+    data: HashMap<Bytes, Bytes>,
 }
 
 impl Store {
@@ -12,11 +14,11 @@ impl Store {
         Self { data: HashMap::new() }
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.data.get(key).map(Vec::as_slice)
+    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+        self.data.get(key).cloned()
     }
 
-    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    pub fn set(&mut self, key: Bytes, value: Bytes) {
         self.data.insert(key, value);
     }
 
