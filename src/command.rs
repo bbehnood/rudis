@@ -44,6 +44,19 @@ pub enum CommandError {
 const MAX_COMMAND_LEN: usize = 16;
 
 impl Command {
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ping => "PING",
+            Self::Echo(_) => "ECHO",
+            Self::Get(_) => "GET",
+            Self::Set { .. } => "SET",
+            Self::Del(_) => "DEL",
+            Self::Exists(_) => "EXISTS",
+            Self::Incr(_) => "INCR",
+        }
+    }
+
     pub fn from_resp(value: RespValue) -> Result<Self, CommandError> {
         let values = match value {
             RespValue::Array(Some(values)) => values,

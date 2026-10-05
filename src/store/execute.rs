@@ -2,6 +2,7 @@ use std::collections::hash_map::Entry;
 
 use bytes::Bytes;
 use thiserror::Error;
+use tracing::debug;
 
 use crate::{Command, RespValue, store::Store};
 
@@ -42,7 +43,10 @@ impl Store {
 
             Command::Incr(key) => match self.incr(key) {
                 Ok(n) => RespValue::Integer(n),
-                Err(e) => RespValue::Error(format!("ERR {e}")),
+                Err(e) => {
+                    debug!(error = %e, "INCR failed");
+                    RespValue::Error(format!("ERR {e}"))
+                },
             },
         }
     }
