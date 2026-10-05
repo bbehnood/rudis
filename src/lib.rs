@@ -9,6 +9,7 @@ pub use store::Store;
 use std::{
     io,
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use tokio::{
@@ -25,6 +26,7 @@ pub struct Server {
 
 const BUFFER_SIZE: usize = 4096;
 const MAX_BUFFERED: usize = MAX_BULK_LEN + (64 * 1024);
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 impl Server {
     pub async fn bind(addr: &str) -> io::Result<Self> {
@@ -35,7 +37,17 @@ impl Server {
 
     pub async fn run(self) -> io::Result<()> {
         loop {
-            let (stream, addr) = self.listener.accept().await?;
+            let (stream, addr) = match self.listener.accept().await {
+                Ok(conn) => conn,
+
+                Err(e) if is_connection_error(&e) => continue,
+
+                Err(e) => {
+                    eprintln!("accept error: {e}");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                },
+            };
 
             println!("client connected: {addr}");
 
@@ -128,4 +140,13 @@ fn append_reply(reply: &RespValue, out: &mut Vec<u8>) {
     if reply.encode_into(out).is_err() {
         let _ = RespValue::Error("ERR internal error".into()).encode_into(out);
     }
+}
+
+fn is_connection_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+    )
 }
