@@ -181,7 +181,8 @@ impl<'a> RespParser<'a> {
             return Err(ParseError::TooLarge);
         }
 
-        let mut values = Vec::with_capacity(len);
+        let remaining = self.buf.len() - self.pos;
+        let mut values = Vec::with_capacity(len.min(remaining / 3));
 
         for _ in 0..len {
             values.push(self.parse_value(depth + 1)?);
@@ -643,6 +644,12 @@ mod tests {
         let (v, consumed) = parse(input).unwrap();
         assert_eq!(v, RespValue::Array(Some(vec![RespValue::Integer(1)])));
         assert_eq!(consumed, 8);
+    }
+
+    #[test]
+    fn huge_array_header_without_a_body_is_incomplete() {
+        let input = format!("*{MAX_ARRAY_LEN}\r\n");
+        assert_eq!(parse(&input.as_bytes()), Err(ParseError::Incomplete));
     }
 
     // ---------- Depth limit ----------
