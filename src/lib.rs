@@ -32,9 +32,7 @@ const MAX_LOGGED_LEN: usize = 128;
 
 impl Server {
     pub async fn bind(addr: &str) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr).await.inspect_err(
-            |e| error!(addr, error = %e, "failed to bind listener"),
-        )?;
+        let listener = TcpListener::bind(addr).await?;
 
         info!(addr = %listener.local_addr()?, "listening for connections");
 

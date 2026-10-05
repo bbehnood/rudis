@@ -1,17 +1,29 @@
-use std::io::{self, IsTerminal};
+use std::{
+    io::{self, IsTerminal},
+    process::ExitCode,
+};
 
 use rudis::Server;
+use tracing::error;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
+const ADDR: &str = "127.0.0.1:6379";
+
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> ExitCode {
     init_tracing();
 
-    let server = Server::bind("127.0.0.1:6379").await?;
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            error!(addr = ADDR, error = %e, "server failed");
+            ExitCode::FAILURE
+        },
+    }
+}
 
-    server.run().await?;
-
-    Ok(())
+async fn run() -> io::Result<()> {
+    Server::bind(ADDR).await?.run().await
 }
 
 fn init_tracing() {
