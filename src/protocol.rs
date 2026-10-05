@@ -13,18 +13,25 @@ pub enum RespValue {
 pub enum ParseError {
     #[error("incomplete frame")]
     Incomplete,
+
     #[error("invalid type byte: {0}")]
     InvalidType(u8),
+
     #[error("invalid integer")]
     InvalidInteger,
+
     #[error("invalid length")]
     InvalidLength,
+
     #[error("invalid utf-8 in simple string/error")]
     InvalidUtf8,
+
     #[error("expected CRLF")]
     MissingCrlf,
+
     #[error("frame exceeds size limit")]
     TooLarge,
+
     #[error("frame nested too deeply")]
     TooDeep,
 }

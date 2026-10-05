@@ -21,8 +21,3 @@ match_block_trailing_comma = true
 # Chains / conditionals
 chain_width = 60
 single_line_if_else_max_width = 50
-
-# Comments & documentation
-format_code_in_doc_comments = true
-normalize_comments = true
-wrap_comments = true
