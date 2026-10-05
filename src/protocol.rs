@@ -53,6 +53,7 @@ pub struct RespParser<'a> {
 
 pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 pub const MAX_ARRAY_LEN: usize = 1024 * 1024;
+pub const MAX_LINE_LEN: usize = 64 * 1024;
 pub const MAX_DEPTH: usize = 32;
 
 impl<'a> RespParser<'a> {
@@ -203,17 +204,21 @@ impl<'a> RespParser<'a> {
     fn read_line(&mut self) -> Result<&'a [u8], ParseError> {
         let start = self.pos;
 
-        while self.pos + 1 < self.buf.len() {
-            if self.buf[self.pos] == b'\r' && self.buf[self.pos + 1] == b'\n' {
-                let line = &self.buf[start..self.pos];
-                self.pos += 2;
-                return Ok(line);
-            }
+        let limit = start.saturating_add(MAX_LINE_LEN + 2);
+        let window = &self.buf[start..self.buf.len().min(limit)];
 
-            self.pos += 1;
+        match window.windows(2).position(|w| w == b"\r\n") {
+            Some(i) => {
+                self.pos = start + i + 2;
+                Ok(&self.buf[start..start + i])
+            },
+
+            None if window.len() >= MAX_LINE_LEN + 2 => {
+                Err(ParseError::TooLarge)
+            },
+
+            None => Err(ParseError::Incomplete),
         }
-
-        Err(ParseError::Incomplete)
     }
 
     fn expect_crlf(&mut self) -> Result<(), ParseError> {
@@ -733,6 +738,36 @@ mod tests {
             "invalid type byte: 63"
         );
         assert_eq!(ParseError::TooDeep.to_string(), "frame nested too deeply");
+    }
+
+    // ---------- Line limit ----------
+
+    #[test]
+    fn line_at_limit_is_ok() {
+        let mut input = vec![b'+'];
+        input.extend(std::iter::repeat(b'a').take(MAX_LINE_LEN));
+        input.extend_from_slice(b"\r\n");
+        assert!(parse(&input).is_ok());
+    }
+
+    #[test]
+    fn line_over_limit_is_too_large() {
+        let mut input = vec![b'+'];
+        input.extend(std::iter::repeat(b'a').take(MAX_LINE_LEN + 1));
+        input.extend_from_slice(b"\r\n");
+        assert_eq!(parse(&input), Err(ParseError::TooLarge));
+    }
+
+    #[test]
+    fn unterminated_oversized_line_is_too_large_without_crlf() {
+        let mut input = vec![b'+'];
+        input.extend(std::iter::repeat(b'a').take(MAX_LINE_LEN + 2));
+        assert_eq!(parse(&input), Err(ParseError::TooLarge));
+    }
+
+    #[test]
+    fn unterminated_short_line_is_incomplete() {
+        assert_eq!(parse(b"+abc"), Err(ParseError::Incomplete));
     }
 }
 
